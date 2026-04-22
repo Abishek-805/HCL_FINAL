@@ -1,12 +1,63 @@
 import streamlit as st
 import numpy as np
 import joblib
+import json
+import os
+import shutil
+import tempfile
+import h5py
 from tensorflow.keras.models import load_model
 
 # =========================
 # LOAD MODEL
 # =========================
-model = load_model("dl_model.h5", compile=False)
+def _remove_quantization_config(obj):
+    if isinstance(obj, dict):
+        obj = {k: _remove_quantization_config(v) for k, v in obj.items() if k != "quantization_config"}
+        return obj
+    if isinstance(obj, list):
+        return [_remove_quantization_config(item) for item in obj]
+    return obj
+
+
+def _load_model_compat(model_path):
+    try:
+        return load_model(model_path, compile=False)
+    except Exception as err:
+        if "quantization_config" not in str(err):
+            raise
+
+        with tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as tmp:
+            patched_path = tmp.name
+
+        shutil.copyfile(model_path, patched_path)
+
+        try:
+            with h5py.File(patched_path, "r+") as h5f:
+                raw_config = h5f.attrs.get("model_config")
+                if raw_config is None:
+                    raise
+
+                if isinstance(raw_config, bytes):
+                    config_text = raw_config.decode("utf-8")
+                elif hasattr(raw_config, "decode"):
+                    config_text = raw_config.decode("utf-8")
+                else:
+                    config_text = str(raw_config)
+
+                config_json = json.loads(config_text)
+                cleaned_config = _remove_quantization_config(config_json)
+                h5f.attrs.modify("model_config", json.dumps(cleaned_config).encode("utf-8"))
+
+            return load_model(patched_path, compile=False)
+        finally:
+            try:
+                os.remove(patched_path)
+            except OSError:
+                pass
+
+
+model = _load_model_compat("dl_model.h5")
 scaler_X = joblib.load("scaler_X.pkl")
 scaler_y = joblib.load("scaler_y.pkl")
 
